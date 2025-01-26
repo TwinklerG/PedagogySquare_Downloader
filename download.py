@@ -23,7 +23,7 @@ from contextlib import closing
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+from concurrent.futures import ThreadPoolExecutor
 
 # Get Hex-md5 encoded password
 def hex_md5_stringify(raw_str:str):
@@ -117,11 +117,14 @@ def check_cid(cid):
         return False
     return cid not in cid_expel_list
 
+tasks = []
 print("\nReady to download the following courses:")
 for cid, cname in cid2name_dict.items():
     if not check_cid(cid):
         continue
     print("Course: {:8s}, CID={:6}".format(cname, cid))
+
+thread_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="downloader_")
 
 for cid in cid_list:
     cid = str(cid) # Prevent bug caused by wrong type of cid
@@ -134,98 +137,100 @@ for cid in cid_list:
     except KeyError:
         print("Can't find course name for cid {}, maybe it's a legacy course?".format(cid))
         course_name = "CID_{}".format(cid)
-    print("\nDownloading files of course {}".format(course_name))
 
-    # Create dir for this course
-    root= pathlib.Path(os.getcwd()) / course_name
-    if not root.exists() or root.is_file():
-        os.makedirs(root)
+    def download_cid(cid: int):
+        # Create dir for this course
+        root= pathlib.Path(os.getcwd()) / course_name
+        if not root.exists() or root.is_file():
+            os.makedirs(root)
 
-    # Construct attachment list, with some dirs in it
-    course_attachment_list = construct_attchment_list(sess=sess, token=token, pid=0, uid=uid, cid=cid, parent_dir=pathlib.Path("."))
+        # Construct attachment list, with some dirs in it
+        course_attachment_list = construct_attchment_list(sess=sess, token=token, pid=0, uid=uid, cid=cid, parent_dir=pathlib.Path("."))
 
-    # Iteratively add files in dirs to global attachment list
-    dir_counter = 0
-    for entry in course_attachment_list:
-        if (entry.get('ext') == 'dir'):
-            dir_counter += 1
-            # Add dir content to attachment list
-            dir_id = entry.get('id')
-            dir_name = filename_filter(entry.get('title')) if keep_dirs else ''
-            parent_dir = entry.get('parent_dir')
-            if not (root/parent_dir/dir_name).exists():
-                os.makedirs(root/parent_dir/dir_name)
-            course_attachment_list.extend(construct_attchment_list(sess=sess, token=token, pid=dir_id, uid=uid, cid=cid, parent_dir=parent_dir/dir_name))
+        # Iteratively add files in dirs to global attachment list
+        dir_counter = 0
+        for entry in course_attachment_list:
+            if (entry.get('ext') == 'dir'):
+                dir_counter += 1
+                # Add dir content to attachment list
+                dir_id = entry.get('id')
+                dir_name = filename_filter(entry.get('title')) if keep_dirs else ''
+                parent_dir = entry.get('parent_dir')
+                if not (root/parent_dir/dir_name).exists():
+                    os.makedirs(root/parent_dir/dir_name)
+                course_attachment_list.extend(construct_attchment_list(sess=sess, token=token, pid=dir_id, uid=uid, cid=cid, parent_dir=parent_dir/dir_name))
 
-    print("Get {:d} files with {:d} dirs".format(len(course_attachment_list)-dir_counter, dir_counter))
+        print("Get {:d} files with {:d} dirs".format(len(course_attachment_list)-dir_counter, dir_counter))
 
-    # Download attachments
-    for entry in course_attachment_list:
-        ext = entry.get('ext')
-        if (ext == 'dir') or (ext in ext_expel_list):
-            continue
-
-        if (ext in entry.get('title')):
-            filename = filename_filter(entry.get('title'))
-        else:
-            filename = filename_filter("{}.{}".format(entry.get('title'), ext))
-        filepath = root/entry.get("parent_dir")/filename
-
-        filesize = entry.get('size')
-
-        # Get download url for un-downloadable files
-        if (entry.get('can_download') == '0'):
-            attachment_detail_url = attachment_detail_url_fmt.format(token, entry.get('id'), uid, cid)
-            r = sess.get(attachment_detail_url, verify=False)
-            info = r.json()['message']
-            entry['path'] = info.get('path')
-
-        with closing(requests.get(entry.get('path').replace('amp;', ''), stream=True)) as res:
-
-            try:
-                content_size = eval(res.headers['content-length'])
-            except Exception:
-                print("Failed to get content length of file {}, please download it manually.".format(filename))
+        # Download attachments
+        for entry in course_attachment_list:
+            ext = entry.get('ext')
+            if (ext == 'dir') or (ext in ext_expel_list):
                 continue
 
-            if filepath.exists() and filepath.is_file():
-                # If file is up-to date, continue; else, delete and re-download
-                if os.path.getsize(filepath) == content_size:
-                    print("File {:\u3000<20} is up-to-date".format(filename))
+            if (ext in entry.get('title')):
+                filename = filename_filter(entry.get('title'))
+            else:
+                filename = filename_filter("{}.{}".format(entry.get('title'), ext))
+            filepath = root/entry.get("parent_dir")/filename
+
+            filesize = entry.get('size')
+
+            # Get download url for un-downloadable files
+            if (entry.get('can_download') == '0'):
+                attachment_detail_url = attachment_detail_url_fmt.format(token, entry.get('id'), uid, cid)
+                r = sess.get(attachment_detail_url, verify=False)
+                info = r.json()['message']
+                entry['path'] = info.get('path')
+
+            with closing(requests.get(entry.get('path').replace('amp;', ''), stream=True)) as res:
+
+                try:
+                    content_size = eval(res.headers['content-length'])
+                except Exception:
+                    print("Failed to get content length of file {}, please download it manually.".format(filename))
                     continue
-                else:
-                    print("Updating File {}".format(filename))
-                    os.remove(filepath)
 
-            print("Downloading {:\u3000<20s}, filesize = {}".format(filename, filesize))
-            chunk_size = min(content_size, 10240)
-            with open(filepath, "wb") as f:
-                chunk_count = 0
-                start_time = time.time()
-                # previous_time = time.time()
-                # lag_counter = 0
-                total = content_size / 1024 / 1024
-                for data in res.iter_content(chunk_size=chunk_size):
-                    chunk_count += 1
-                    processed = len(data) * chunk_count / 1024 / 1024
-                    current_time = time.time()
-                    if chunk_count < 5:
-                        print(r"    Total: {:.2f} MB  Processed: {:.2f} MB ({:.2f}%)".format(total, processed, processed/total*100), end = '\r')
+                if filepath.exists() and filepath.is_file():
+                    # If file is up-to date, continue; else, delete and re-download
+                    if os.path.getsize(filepath) == content_size:
+                        print("File {:\u3000<20} is up-to-date".format(filename))
+                        continue
                     else:
-                        remaining = (current_time-start_time)/processed*(total-processed)
-                        print(r"    Total: {:.2f} MB  Processed: {:.2f} MB ({:.2f}%), ETA {:.2f}s".format(total, processed, processed/total*100, remaining), end = '\r')
-                    f.write(data)
+                        print("Updating File {}".format(filename))
+                        os.remove(filepath)
 
-                    # speed = chunk_size / 1.0 * (current_time - previous_time)
-                    # if speed < speed_threshold:
-                    #     lag_counter += 1
-                    # else:
-                    #     lag_counter = 0
+                print("Downloading {:\u3000<20s}, filesize = {}".format(filename, filesize))
+                chunk_size = min(content_size, 10240)
+                with open(filepath, "wb") as f:
+                    chunk_count = 0
+                    start_time = time.time()
+                    # previous_time = time.time()
+                    # lag_counter = 0
+                    total = content_size / 1024 / 1024
+                    for data in res.iter_content(chunk_size=chunk_size):
+                        chunk_count += 1
+                        processed = len(data) * chunk_count / 1024 / 1024
+                        current_time = time.time()
+                        if chunk_count < 5:
+                            print(r"    Total: {:.2f} MB  Processed: {:.2f} MB ({:.2f}%)".format(total, processed, processed/total*100), end = '\r')
+                        else:
+                            remaining = (current_time-start_time)/processed*(total-processed)
+                            print(r"    Total: {:.2f} MB  Processed: {:.2f} MB ({:.2f}%), ETA {:.2f}s".format(total, processed, processed/total*100, remaining), end = '\r')
+                        f.write(data)
 
-                    # if lag_counter > 10:
-                    #     print("Restart downloading of file {}".format(filename))
-                    #     attachment_list.append(entry)
-                    #     continue
+                        # speed = chunk_size / 1.0 * (current_time - previous_time)
+                        # if speed < speed_threshold:
+                        #     lag_counter += 1
+                        # else:
+                        #     lag_counter = 0
 
+                        # if lag_counter > 10:
+                        #     print("Restart downloading of file {}".format(filename))
+                        #     attachment_list.append(entry)
+                        #     continue
+    thread_pool.submit(download_cid, cid)
+    print("\nDownloading files of course {}".format(course_name))
 
+thread_pool.shutdown(wait=True)
 print("Done!")
